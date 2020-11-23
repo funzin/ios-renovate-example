@@ -1,0 +1,25 @@
+{
+  "packageRules": [
+    {
+      "groupName": "RxSwift",
+      "managers": [
+        "cocoapods"
+      ],
+      "packageNames": [
+        "RxCocoa",
+        "RxRelay",
+        "RxSwift"
+      ]
+    },
+    {
+      "groupName": "SwiftLint",
+      "managers": [
+        "cocoapods"
+      ],
+      "packageNames": [
+        "SwiftLint"
+      ],
+      "enabled": false
+    }
+  ]
+}
