@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2015-2020 Alexander Grebenyuk (github.com/kean).
+// Copyright (c) 2015-2021 Alexander Grebenyuk (github.com/kean).
 
 import Foundation
 
@@ -15,25 +15,27 @@ import Foundation
 /// image pipeline are represented using Operation to take advantage of these features.
 ///
 /// - warning: Must be thread-confined!
-final class Task<Value, Error>: TaskSubscriptionDelegate {
+class Task<Value, Error>: TaskSubscriptionDelegate {
 
     private struct Subscription {
         let observer: (Event) -> Void
         var priority: TaskPriority
     }
 
-    private var subscriptions = [TaskSubscriptionKey: Subscription]()
-    private var nextSubscriptionId = 0
+    // In most situations, especially for intermediate tasks, the almost almost
+    // only one subscription.
+    private var inlineSubscription: Subscription?
+    private var subscriptions: [TaskSubscriptionKey: Subscription]? // Create lazily
+    private var nextSubscriptionKey = 0
 
     /// Returns `true` if the task was either cancelled, or was completed.
     private(set) var isDisposed = false
+    private var isStarted = false
 
     /// Gets called when the task is either cancelled, or was completed.
     var onDisposed: (() -> Void)?
 
     var onCancelled: (() -> Void)?
-
-    private var starter: ((Task) -> Void)?
 
     private var priority: TaskPriority = .normal {
         didSet {
@@ -55,38 +57,53 @@ final class Task<Value, Error>: TaskSubscriptionDelegate {
 
     weak var operation: Foundation.Operation? {
         didSet {
+            guard priority != .normal else { return }
             operation?.queuePriority = priority.queuePriority
         }
     }
 
     /// Publishes the results of the task.
-    var publisher: Publisher {
-        return Publisher(task: self)
+    var publisher: Publisher { Publisher(task: self) }
+
+    #if TRACK_ALLOCATIONS
+    deinit {
+        Allocations.decrement("Task")
     }
 
-    /// Initializes the task with the `starter`.
-    /// - parameter starter: The closure which gets called as soon as the first
-    /// subscription is added to the task. Only gets called once and is immediatelly
-    /// deallocated after it is called.
-    init(starter: ((Task) -> Void)? = nil) {
-        self.starter = starter
+    init() {
+        Allocations.increment("Task")
     }
+    #endif
+
+    /// Override this to start image task. Only gets called once.
+    func start() {}
 
     // MARK: - Managing Observers
 
     /// - notes: Returns `nil` if the task was disposed.
-    fileprivate func subscribe(priority: TaskPriority = .normal, _ observer: @escaping (Event) -> Void) -> TaskSubscription? {
+    private func subscribe(priority: TaskPriority = .normal, _ observer: @escaping (Event) -> Void) -> TaskSubscription? {
         guard !isDisposed else { return nil }
 
-        nextSubscriptionId += 1
-        let subscriptionKey = nextSubscriptionId
+        let subscriptionKey = nextSubscriptionKey
+        nextSubscriptionKey += 1
         let subscription = TaskSubscription(task: self, key: subscriptionKey)
 
-        subscriptions[subscriptionKey] = Subscription(observer: observer, priority: priority)
-        updatePriority()
+        if subscriptionKey == 0 {
+            inlineSubscription = Subscription(observer: observer, priority: priority)
+        } else {
+            if subscriptions == nil { subscriptions = [:] }
+            subscriptions![subscriptionKey] = Subscription(observer: observer, priority: priority)
+        }
 
-        starter?(self)
-        starter = nil
+        updatePriority(suggestedPriority: priority)
+
+        if !isStarted {
+            isStarted = true
+            start()
+        }
+
+        // The task may have been completed synchronously by `starter`.
+        guard !isDisposed else { return nil }
 
         return subscription
     }
@@ -96,18 +113,28 @@ final class Task<Value, Error>: TaskSubscriptionDelegate {
     fileprivate func setPriority(_ priority: TaskPriority, for key: TaskSubscriptionKey) {
         guard !isDisposed else { return }
 
-        subscriptions[key]?.priority = priority
-        updatePriority()
+        if key == 0 {
+            inlineSubscription?.priority = priority
+        } else {
+            subscriptions![key]?.priority = priority
+        }
+        updatePriority(suggestedPriority: priority)
     }
 
     fileprivate func unsubsribe(key: TaskSubscriptionKey) {
-        guard subscriptions.removeValue(forKey: key) != nil else { return } // Already unsubscribed from this task
+        if key == 0 {
+            guard inlineSubscription != nil else { return }
+            inlineSubscription = nil
+        } else {
+            guard subscriptions!.removeValue(forKey: key) != nil else { return }
+        }
+
         guard !isDisposed else { return }
 
-        if subscriptions.isEmpty {
+        if inlineSubscription == nil && subscriptions?.isEmpty ?? true {
             terminate(reason: .cancelled)
         } else {
-            updatePriority()
+            updatePriority(suggestedPriority: nil)
         }
     }
 
@@ -139,8 +166,11 @@ final class Task<Value, Error>: TaskSubscriptionDelegate {
             terminate(reason: .finished)
         }
 
-        for context in subscriptions.values {
-            context.observer(event)
+        inlineSubscription?.observer(event)
+        if let subscriptions = subscriptions {
+            for subscription in subscriptions.values {
+                subscription.observer(event)
+            }
         }
     }
 
@@ -164,8 +194,26 @@ final class Task<Value, Error>: TaskSubscriptionDelegate {
 
     // MARK: - Priority
 
-    private func updatePriority() {
-        priority = subscriptions.values.map({ $0.priority }).max() ?? .normal
+    private func updatePriority(suggestedPriority: TaskPriority?) {
+        if let suggestedPriority = suggestedPriority, suggestedPriority >= priority {
+            // No need to recompute, won't go higher than that
+            priority = suggestedPriority
+            return
+        }
+
+        var newPriority = inlineSubscription?.priority
+        // Same as subscriptions.map { $0?.priority }.max() but without allocating
+        // any memory for redundant arrays
+        if let subscriptions = subscriptions {
+            for subscription in subscriptions.values {
+                if newPriority == nil {
+                    newPriority = subscription.priority
+                } else if subscription.priority > newPriority! {
+                    newPriority = subscription.priority
+                }
+            }
+        }
+        self.priority = newPriority ?? .normal
     }
 }
 
@@ -174,23 +222,23 @@ final class Task<Value, Error>: TaskSubscriptionDelegate {
 extension Task {
     /// Publishes the results of the task.
     struct Publisher {
-        let task: Task
+        fileprivate let task: Task
 
         /// Attaches the subscriber to the task.
         /// - notes: Returns `nil` if the task is already disposed.
         func subscribe(priority: TaskPriority = .normal, _ observer: @escaping (Event) -> Void) -> TaskSubscription? {
-            return task.subscribe(priority: priority, observer)
+            task.subscribe(priority: priority, observer)
         }
 
         /// Attaches the subscriber to the task. Automatically forwards progress
         /// andd error events to the given task.
         /// - notes: Returns `nil` if the task is already disposed.
-        func subscribe<NewValue>(_ task: Task<NewValue, Error>, onValue: @escaping (Value, Bool, Task<NewValue, Error>) -> Void) -> TaskSubscription? {
-            return subscribe { [weak task] event in
+        func subscribe<NewValue>(_ task: Task<NewValue, Error>, onValue: @escaping (Value, Bool) -> Void) -> TaskSubscription? {
+            subscribe { [weak task] event in
                 guard let task = task else { return }
                 switch event {
                 case let .value(value, isCompleted):
-                    onValue(value, isCompleted, task)
+                    onValue(value, isCompleted)
                 case let .progress(progress):
                     task.send(progress: progress)
                 case let .error(error):
@@ -206,7 +254,23 @@ struct TaskProgress: Hashable {
     let total: Int64
 }
 
-typealias TaskPriority = ImageRequest.Priority // typealias will do for now
+enum TaskPriority: Int, Comparable {
+    case veryLow = 0, low, normal, high, veryHigh
+
+    var queuePriority: Operation.QueuePriority {
+        switch self {
+        case .veryLow: return .veryLow
+        case .low: return .low
+        case .normal: return .normal
+        case .high: return .high
+        case .veryHigh: return .veryHigh
+        }
+    }
+
+    static func < (lhs: TaskPriority, rhs: TaskPriority) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
 
 // MARK: - Task.Event {
 extension Task {
@@ -231,7 +295,7 @@ extension Task.Event: Equatable where Value: Equatable, Error: Equatable {}
 
 /// Represents a subscription to a task. The observer must retain a strong
 /// reference to a subscription.
-final class TaskSubscription {
+struct TaskSubscription {
     private let task: TaskSubscriptionDelegate
     private let key: TaskSubscriptionKey
 
@@ -271,32 +335,29 @@ private typealias TaskSubscriptionKey = Int
 // MARK: - TaskPool
 
 /// Contains the tasks which haven't completed yet.
-final class TaskPool<Value, Error> {
+final class TaskPool<Key: Hashable, Value, Error> {
     private let isDeduplicationEnabled: Bool
-    private var map = [AnyHashable: Task<Value, Error>]()
+    private var map = [Key: Task<Value, Error>]()
 
     init(_ isDeduplicationEnabled: Bool) {
         self.isDeduplicationEnabled = isDeduplicationEnabled
     }
 
-    func publisher(withKey key: AnyHashable, starter: @escaping (Task<Value, Error>) -> Void) -> Task<Value, Error>.Publisher {
-        return task(withKey: key) {
-            Task<Value, Error>(starter: starter)
-        }.publisher
-    }
-
-    private func task(withKey key: AnyHashable, _ make: () -> Task<Value, Error>) -> Task<Value, Error> {
+    /// Creates a task with the given key. If there is an outstanding task with
+    /// the given key in the pool, the existing task is returned. Tasks are
+    /// automatically removed from the pool when they are disposed.
+    func publisherForKey(_ key: Key, _ make: () -> Task<Value, Error>) -> Task<Value, Error>.Publisher {
         guard isDeduplicationEnabled else {
-            return make()
+            return make().publisher
         }
         if let task = map[key] {
-            return task
+            return task.publisher
         }
         let task = make()
         map[key] = task
         task.onDisposed = { [weak self] in
             self?.map[key] = nil
         }
-        return task
+        return task.publisher
     }
 }
