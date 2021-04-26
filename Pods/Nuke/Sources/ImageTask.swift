@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2015-2020 Alexander Grebenyuk (github.com/kean).
+// Copyright (c) 2015-2021 Alexander Grebenyuk (github.com/kean).
 
 import Foundation
 
@@ -17,9 +17,9 @@ import AppKit.NSImage
 /// to maintain a reference to the task unless it is useful to do so for your
 /// app’s internal bookkeeping purposes.
 public /* final */ class ImageTask: Hashable, CustomStringConvertible {
-    /// An identifier uniquely identifies the task within a given pipeline. Only
-    /// unique within this pipeline.
-    public let taskId: Int
+    /// An identifier that uniquely identifies the task within a given pipeline. Only
+    /// unique within that pipeline.
+    public let taskId: Int64
 
     let isDataTask: Bool
 
@@ -49,30 +49,29 @@ public /* final */ class ImageTask: Hashable, CustomStringConvertible {
     }
     private(set) var _progress: Progress?
 
-    var isCancelled: Bool {
-        lock?.lock()
-        defer { lock?.unlock() }
-        return _isCancelled
+    var isCancelled: Bool { _isCancelled.pointee == 1 }
+    private let _isCancelled: UnsafeMutablePointer<Int32>
+
+    deinit {
+        self._isCancelled.deallocate()
+        #if TRACK_ALLOCATIONS
+        Allocations.decrement("ImageTask")
+        #endif
     }
-    private(set) var _isCancelled = false
-    private let lock: NSLock?
 
-    let queue: DispatchQueue?
-
-    /// A completion handler to be called when task finishes or fails.
-    public typealias Completion = (_ result: Result<ImageResponse, ImagePipeline.Error>) -> Void
-
-    /// A progress handler to be called periodically during the lifetime of a task.
-    public typealias ProgressHandler = (_ intermediateResponse: ImageResponse?, _ completedUnitCount: Int64, _ totalUnitCount: Int64) -> Void
-
-    init(taskId: Int, request: ImageRequest, isMainThreadConfined: Bool = false, isDataTask: Bool, queue: DispatchQueue?) {
+    init(taskId: Int64, request: ImageRequest, isDataTask: Bool) {
         self.taskId = taskId
         self.request = request
         self._priority = request.priority
         self.priority = request.priority
         self.isDataTask = isDataTask
-        self.queue = queue
-        lock = isMainThreadConfined ? nil : NSLock()
+
+        self._isCancelled = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        self._isCancelled.initialize(to: 0)
+
+        #if TRACK_ALLOCATIONS
+        Allocations.increment("ImageTask")
+        #endif
     }
 
     /// Marks task as being cancelled.
@@ -81,19 +80,7 @@ public /* final */ class ImageTask: Hashable, CustomStringConvertible {
     /// unless there is an equivalent outstanding task running (see
     /// `ImagePipeline.Configuration.isDeduplicationEnabled` for more info).
     public func cancel() {
-        if let lock = lock {
-            lock.lock()
-            defer { lock.unlock() }
-            _cancel()
-        } else {
-            assert(Thread.isMainThread, "Must be cancelled only from the main thread")
-            _cancel()
-        }
-    }
-
-    private func _cancel() {
-        if !_isCancelled {
-            _isCancelled = true
+        if OSAtomicCompareAndSwap32Barrier(0, 1, _isCancelled) {
             pipeline?.imageTaskCancelCalled(self)
         }
     }
@@ -114,38 +101,91 @@ public /* final */ class ImageTask: Hashable, CustomStringConvertible {
     }
 
     public static func == (lhs: ImageTask, rhs: ImageTask) -> Bool {
-        return ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
+        ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
     }
 
     // MARK: - CustomStringConvertible
 
     public var description: String {
-        return "ImageTask(id: \(taskId), priority: \(priority), completedUnitCount: \(completedUnitCount), totalUnitCount: \(totalUnitCount), isCancelled: \(isCancelled))"
+        "ImageTask(id: \(taskId), priority: \(priority), completedUnitCount: \(completedUnitCount), totalUnitCount: \(totalUnitCount), isCancelled: \(isCancelled))"
+    }
+}
+
+// MARK: - ImageContainer
+
+public struct ImageContainer {
+    public var image: PlatformImage
+    public var type: ImageType?
+    /// Returns `true` if the image in the container is a preview of the image.
+    public var isPreview: Bool
+    /// Contains the original image `data`, but only if the decoder decides to
+    /// attach it to the image.
+    ///
+    /// The default decoder (`ImageDecoders.Default`) attaches data to GIFs to
+    /// allow to display them using a rendering engine of your choice.
+    ///
+    /// - note: The `data`, along with the image container itself gets stored in the memory
+    /// cache.
+    public var data: Data?
+    public var userInfo: [AnyHashable: Any]
+
+    public init(image: PlatformImage, type: ImageType? = nil, isPreview: Bool = false, data: Data? = nil, userInfo: [AnyHashable: Any] = [:]) {
+        self.image = image
+        self.type = type
+        self.isPreview = isPreview
+        self.data = data
+        self.userInfo = userInfo
+    }
+
+    /// Modifies the wrapped image and keeps all of the rest of the metadata.
+    public func map(_ closure: (PlatformImage) -> PlatformImage?) -> ImageContainer? {
+        guard let image = closure(self.image) else {
+            return nil
+        }
+        return ImageContainer(image: image, type: type, isPreview: isPreview, data: data, userInfo: userInfo)
     }
 }
 
 // MARK: - ImageResponse
 
-/// Represents an image response.
+/// Represents a response of a particular image task.
 public final class ImageResponse {
-    public let image: PlatformImage
+    public let container: ImageContainer
+    /// A convenience computed property which returns an image from the container.
+    public var image: PlatformImage { container.image }
     public let urlResponse: URLResponse?
+
     // the response is only nil when new disk cache is enabled (it only stores
     // data for now, but this might change in the future).
-    public let scanNumber: Int?
-
-    public init(image: PlatformImage, urlResponse: URLResponse? = nil, scanNumber: Int? = nil) {
-        self.image = image
-        self.urlResponse = urlResponse
-        self.scanNumber = scanNumber
+    @available(*, deprecated, message: "Please use `container.userInfo[ImageDecoders.Default.scanNumberKey]` instead.") // Deprecated in Nuke 9.0
+    public var scanNumber: Int? {
+        if let number = _scanNumber {
+            return number // Deprecated version
+        }
+        return container.userInfo[ImageDecoders.Default.scanNumberKey] as? Int
     }
 
-    func map(_ transformation: (PlatformImage) -> PlatformImage?) -> ImageResponse? {
+    private let _scanNumber: Int?
+
+    @available(*, deprecated, message: "Please use `ImageResponse.init(container:urlResponse:)` instead.") // Deprecated in Nuke 9.0
+    public init(image: PlatformImage, urlResponse: URLResponse? = nil, scanNumber: Int? = nil) {
+        self.container = ImageContainer(image: image)
+        self.urlResponse = urlResponse
+        self._scanNumber = scanNumber
+    }
+
+    public init(container: ImageContainer, urlResponse: URLResponse? = nil) {
+        self.container = container
+        self.urlResponse = urlResponse
+        self._scanNumber = nil
+    }
+
+    func map(_ transformation: (ImageContainer) -> ImageContainer?) -> ImageResponse? {
         return autoreleasepool {
-            guard let output = transformation(image) else {
+            guard let output = transformation(container) else {
                 return nil
             }
-            return ImageResponse(image: output, urlResponse: urlResponse, scanNumber: scanNumber)
+            return ImageResponse(container: output, urlResponse: urlResponse)
         }
     }
 }

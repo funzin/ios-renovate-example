@@ -1,11 +1,12 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2015-2020 Alexander Grebenyuk (github.com/kean).
+// Copyright (c) 2015-2021 Alexander Grebenyuk (github.com/kean).
 
 import Foundation
 
 #if !os(macOS)
 import UIKit.UIImage
+import UIKit.UIColor
 /// Alias for `UIImage`.
 public typealias PlatformImage = UIImage
 #else
@@ -18,15 +19,25 @@ public typealias PlatformImage = NSImage
 /// them compatible with Nuke image loading extensions.
 ///
 /// The protocol is defined as `@objc` to make it possible to override its
-/// methods in extensions (e.g. you can override `nuke_display(image:)` in/
-// `UIImageView` subclass like `Gifu.ImageView).
+/// methods in extensions (e.g. you can override `nuke_display(image:)` in
+/// `UIImageView` subclass like `Gifu.ImageView).
 ///
 /// The protocol and its methods have prefixes to make sure they don't clash
 /// with other similar methods and protocol in Objective-C runtime.
 @objc public protocol Nuke_ImageDisplaying {
     /// Display a given image.
     @objc func nuke_display(image: PlatformImage?)
+
+    #if os(macOS)
+    @objc var layer: CALayer? { get }
+    #endif
 }
+
+#if os(macOS)
+public extension Nuke_ImageDisplaying {
+    var layer: CALayer? { nil }
+}
+#endif
 
 #if os(iOS) || os(tvOS)
 import UIKit
@@ -41,8 +52,9 @@ extension UIImageView: Nuke_ImageDisplaying {
 }
 #elseif os(macOS)
 import Cocoa
-/// An `NSView` that implements `ImageDisplaying` protocol.
-public typealias ImageDisplayingView = NSView & Nuke_ImageDisplaying
+/// An `NSObject` that implements `ImageDisplaying`  and `Animating` protocols.
+/// Can support `NSView` and `NSCell`. The latter can return nil for layer.
+public typealias ImageDisplayingView = NSObject & Nuke_ImageDisplaying
 
 extension NSImageView: Nuke_ImageDisplaying {
     /// Displays an image.
@@ -53,7 +65,7 @@ extension NSImageView: Nuke_ImageDisplaying {
 #elseif os(watchOS)
 import WatchKit
 
-/// An `NSView` that implements `ImageDisplaying` protocol.
+/// A `WKInterfaceObject` that implements `ImageDisplaying` protocol.
 public typealias ImageDisplayingView = WKInterfaceObject & Nuke_ImageDisplaying
 
 extension WKInterfaceImage: Nuke_ImageDisplaying {
@@ -66,32 +78,12 @@ extension WKInterfaceImage: Nuke_ImageDisplaying {
 
 // MARK: - ImageView Extensions
 
-/// Loads an image with the given URL and displays it in the view.
-///
-/// Before loading a new image, the view is prepared for reuse by canceling any
-/// outstanding requests and removing a previously displayed image.
-///
-/// If the image is stored in the memory cache, it is displayed immediately. If not,
-/// the image is loaded using an image pipeline. When the image is loading, the provided
-/// `placeholder` is displayed. When the request completes the loaded image is displayed
-/// (or `failureImage` in case of an error) with the provided transition.
-///
-/// - parameter options: `ImageLoadingOptions.shared` by default.
-/// - parameter view: Nuke keeps a weak reference to the view. If the view is deallocated
-/// the associated request automatically gets canceled.
-/// - parameter progress: A closure to be called periodically on the main thread
-/// when the progress is updated. `nil` by default.
-/// - parameter completion: A closure to be called on the main thread when the
-/// request is finished. Gets called synchronously if the response was found in
-/// the memory cache. `nil` by default.
-/// - returns: An image task or `nil` if the image was found in the memory cache.
 @discardableResult
-public func loadImage(with url: URL,
+public func loadImage(with request: ImageRequestConvertible,
                       options: ImageLoadingOptions = ImageLoadingOptions.shared,
                       into view: ImageDisplayingView,
-                      progress: ImageTask.ProgressHandler? = nil,
-                      completion: ImageTask.Completion? = nil) -> ImageTask? {
-    return loadImage(with: ImageRequest(url: url), options: options, into: view, progress: progress, completion: completion)
+                      completion: @escaping (_ result: Result<ImageResponse, ImagePipeline.Error>) -> Void) -> ImageTask? {
+    loadImage(with: request, options: options, into: view, progress: nil, completion: completion)
 }
 
 /// Loads an image with the given request and displays it in the view.
@@ -99,10 +91,11 @@ public func loadImage(with url: URL,
 /// Before loading a new image, the view is prepared for reuse by canceling any
 /// outstanding requests and removing a previously displayed image.
 ///
-/// If the image is stored in the memory cache, it is displayed immediately. If not,
-/// the image is loaded using an image pipeline. When the image is loading, the provided
-/// `placeholder` is displayed. When the request completes the loaded image is displayed
-/// (or `failureImage` in case of an error) with the provided transition.
+/// If the image is stored in the memory cache, it is displayed immediately with
+/// no animations. If not, the image is loaded using an image pipeline. When the
+/// image is loading, the `placeholder` is displayed. When the request
+/// completes the loaded image is displayed (or `failureImage` in case of an error)
+/// with the selected animation.
 ///
 /// - parameter options: `ImageLoadingOptions.shared` by default.
 /// - parameter view: Nuke keeps a weak reference to the view. If the view is deallocated
@@ -114,14 +107,14 @@ public func loadImage(with url: URL,
 /// the memory cache. `nil` by default.
 /// - returns: An image task or `nil` if the image was found in the memory cache.
 @discardableResult
-public func loadImage(with request: ImageRequest,
+public func loadImage(with request: ImageRequestConvertible,
                       options: ImageLoadingOptions = ImageLoadingOptions.shared,
                       into view: ImageDisplayingView,
-                      progress: ImageTask.ProgressHandler? = nil,
-                      completion: ImageTask.Completion? = nil) -> ImageTask? {
+                      progress: ((_ intermediateResponse: ImageResponse?, _ completedUnitCount: Int64, _ totalUnitCount: Int64) -> Void)? = nil,
+                      completion: ((_ result: Result<ImageResponse, ImagePipeline.Error>) -> Void)? = nil) -> ImageTask? {
     assert(Thread.isMainThread)
     let controller = ImageViewController.controller(for: view)
-    return controller.loadImage(with: request, options: options, progress: progress, completion: completion)
+    return controller.loadImage(with: request.asImageRequest(), options: options, progress: progress, completion: completion)
 }
 
 /// Cancels an outstanding request associated with the view.
@@ -146,15 +139,15 @@ public struct ImageLoadingOptions {
     #if os(iOS) || os(tvOS) || os(macOS)
 
     /// The image transition animation performed when displaying a loaded image.
-    /// Only runs when the image was not found in memory cache. `.nil` by default.
+    /// Only runs when the image was not found in memory cache. `nil` by default.
     public var transition: Transition?
 
     /// The image transition animation performed when displaying a failure image.
-    /// `.nil` by default.
+    /// `nil` by default.
     public var failureImageTransition: Transition?
 
     /// If true, the requested image will always appear with transition, even
-    /// when loaded from cache
+    /// when loaded from cache.
     public var alwaysTransition = false
 
     #endif
@@ -163,6 +156,13 @@ public struct ImageLoadingOptions {
     /// automatically prepared for reuse: image will be set to `nil`, and animations
     /// will be removed. `true` by default.
     public var isPrepareForReuseEnabled = true
+
+    /// If `true`, every progressively generated preview produced by the pipeline
+    /// is going to be displayed. `true` by default.
+    ///
+    /// - note: To enable progressive decoding, see `ImagePipeline.Configuration`,
+    /// `isProgressiveDecodingEnabled` option.
+    public var isProgressiveRenderingEnabled = true
 
     /// Custom pipeline to be used. `nil` by default.
     public var pipeline: ImagePipeline?
@@ -191,27 +191,50 @@ public struct ImageLoadingOptions {
         }
     }
 
+    /// Tint colors to be used for each image type (placeholder, success,
+    /// failure). `nil`  by default (don't change tint color or rendering mode).
+    public var tintColors: TintColors?
+
+    /// Custom tint color to be used for each image type (placeholder, success,
+    /// failure).
+    public struct TintColors {
+        /// Tint color to be used for the loaded image.
+        public var success: UIColor?
+        /// Tint color to be used when displaying a `failureImage`.
+        public var failure: UIColor?
+        /// Tint color to be used when displaying a `placeholder`.
+        public var placeholder: UIColor?
+
+        /// - parameter success: A tint color to be used with a loaded image.
+        /// - parameter failure: A tint color to be used with a `failureImage`.
+        /// - parameter placeholder: A tint color to be used with a `placeholder`.
+        public init(success: UIColor?, failure: UIColor?, placeholder: UIColor?) {
+            self.success = success; self.failure = failure; self.placeholder = placeholder
+        }
+    }
+
     #endif
 
     #if os(iOS) || os(tvOS)
 
     /// - parameter placeholder: Placeholder to be displayed when the image is
     /// loading . `nil` by default.
-    /// - parameter transision: The image transition animation performed when
+    /// - parameter transition: The image transition animation performed when
     /// displaying a loaded image. Only runs when the image was not found in
-    /// memory cache `.nil` by default (no animations).
+    /// memory cache. `nil` by default (no animations).
     /// - parameter failureImage: Image to be displayd when request fails.
     /// `nil` by default.
     /// - parameter failureImageTransition: The image transition animation
-    /// performed when displaying a failure image. `.nil` by default.
+    /// performed when displaying a failure image. `nil` by default.
     /// - parameter contentModes: Content modes to be used for each image type
     /// (placeholder, success, failure). `nil` by default (don't change content mode).
-    public init(placeholder: UIImage? = nil, transition: Transition? = nil, failureImage: UIImage? = nil, failureImageTransition: Transition? = nil, contentModes: ContentModes? = nil) {
+    public init(placeholder: UIImage? = nil, transition: Transition? = nil, failureImage: UIImage? = nil, failureImageTransition: Transition? = nil, contentModes: ContentModes? = nil, tintColors: TintColors? = nil) {
         self.placeholder = placeholder
         self.transition = transition
         self.failureImage = failureImage
         self.failureImageTransition = failureImageTransition
         self.contentModes = contentModes
+        self.tintColors = tintColors
     }
 
     #elseif os(macOS)
@@ -251,12 +274,12 @@ public struct ImageLoadingOptions {
         /// Fade-in transition (cross-fade in case the image view is already
         /// displaying an image).
         public static func fadeIn(duration: TimeInterval, options: UIView.AnimationOptions = .allowUserInteraction) -> Transition {
-            return Transition(style: .fadeIn(parameters:  Parameters(duration: duration, options: options)))
+            Transition(style: .fadeIn(parameters:  Parameters(duration: duration, options: options)))
         }
 
         /// Custom transition. Only runs when the image was not found in memory cache.
         public static func custom(_ closure: @escaping (ImageDisplayingView, UIImage) -> Void) -> Transition {
-            return Transition(style: .custom(closure))
+            Transition(style: .custom(closure))
         }
     }
 
@@ -277,12 +300,12 @@ public struct ImageLoadingOptions {
 
         /// Fade-in transition.
         public static func fadeIn(duration: TimeInterval) -> Transition {
-            return Transition(style: .fadeIn(parameters:  Parameters(duration: duration)))
+            Transition(style: .fadeIn(parameters:  Parameters(duration: duration)))
         }
 
         /// Custom transition. Only runs when the image was not found in memory cache.
         public static func custom(_ closure: @escaping (ImageDisplayingView, NSImage) -> Void) -> Transition {
-            return Transition(style: .custom(closure))
+            Transition(style: .custom(closure))
         }
     }
 
@@ -299,8 +322,6 @@ public struct ImageLoadingOptions {
 /// however as it stands today `ImageViewController` is just a helper class,
 /// making it public wouldn't expose any additional functionality to the users.
 private final class ImageViewController {
-    // Ideally should be `unowned` but can't because of the Swift bug
-    // https://bugs.swift.org/browse/SR-7369
     private weak var imageView: ImageDisplayingView?
     private var task: ImageTask?
 
@@ -331,8 +352,8 @@ private final class ImageViewController {
 
     func loadImage(with request: ImageRequest,
                    options: ImageLoadingOptions,
-                   progress progressHandler: ImageTask.ProgressHandler? = nil,
-                   completion: ImageTask.Completion? = nil) -> ImageTask? {
+                   progress progressHandler: ((_ intermediateResponse: ImageResponse?, _ completedUnitCount: Int64, _ totalUnitCount: Int64) -> Void)? = nil,
+                   completion: ((_ result: Result<ImageResponse, ImagePipeline.Error>) -> Void)? = nil) -> ImageTask? {
         cancelOutstandingTask()
 
         guard let imageView = imageView else {
@@ -343,50 +364,48 @@ private final class ImageViewController {
             #if os(iOS) || os(tvOS)
             imageView.layer.removeAllAnimations()
             #elseif os(macOS)
-            imageView.layer?.removeAllAnimations()
+            let layer = (imageView as? NSView)?.layer ?? imageView.layer
+            layer?.removeAllAnimations()
             #endif
         }
 
         let pipeline = options.pipeline ?? ImagePipeline.shared
 
         // Quick synchronous memory cache lookup
-        if let response = pipeline.cachedResponse(for: request) {
+        if let image = pipeline.cachedImage(for: request) {
+            let response = ImageResponse(container: image)
             handle(result: .success(response), fromMemCache: true, options: options)
-            completion?(.success(response))
-            return nil
+            if !image.isPreview { // Final image was downloaded
+                completion?(.success(response))
+                return nil // No task to perform
+            }
         }
 
         // Display a placeholder.
-        if let placeholder = options.placeholder {
-            imageView.nuke_display(image: placeholder)
+        if var placeholder = options.placeholder {
             #if os(iOS) || os(tvOS)
+            if let tintColor = options.tintColors?.placeholder {
+                placeholder = placeholder.withRenderingMode(.alwaysTemplate)
+                imageView.tintColor = tintColor
+            }
             if let contentMode = options.contentModes?.placeholder {
                 imageView.contentMode = contentMode
             }
             #endif
+            imageView.nuke_display(image: placeholder)
         } else if options.isPrepareForReuseEnabled {
             imageView.nuke_display(image: nil) // Remove previously displayed images (if any)
         }
 
-        // Uses a special internal API (`isMainThreadConfined`) for performance
-        // reasons, it attributes for about than 20% performance improvement.
-        task = pipeline.loadImage(with: request, isMainThreadConfined: true, queue: .main) { [weak self] task, event in
-            switch event {
-            case .progress:
-                progressHandler?(nil, task.completedUnitCount, task.totalUnitCount)
-            case let .value(response, isCompleted):
-                if isCompleted {
-                    self?.handle(result: .success(response), fromMemCache: false, options: options)
-                    completion?(.success(response))
-                } else {
-                    self?.handle(partialImage: response, options: options)
-                    progressHandler?(response, task.completedUnitCount, task.totalUnitCount)
-                }
-            case let .error(error):
-                self?.handle(result: .failure(error), fromMemCache: false, options: options)
-                completion?(.failure(error))
+        task = pipeline.loadImage(with: request, queue: .main, progress: { [weak self] response, completedCount, totalCount in
+            if let response = response, options.isProgressiveRenderingEnabled {
+                self?.handle(partialImage: response, options: options)
             }
-        }
+            progressHandler?(response, completedCount, totalCount)
+        }, completion: { [weak self] result in
+            self?.handle(result: result, fromMemCache: false, options: options)
+            completion?(result)
+        })
         return task
     }
 
@@ -402,22 +421,30 @@ private final class ImageViewController {
     private func handle(result: Result<ImageResponse, ImagePipeline.Error>, fromMemCache: Bool, options: ImageLoadingOptions) {
         switch result {
         case let .success(response):
-            display(response.image, options.transition, options.alwaysTransition, fromMemCache, options.contentModes?.success)
+            display(response.image, options.transition, options.alwaysTransition, fromMemCache, options.contentModes?.success, options.tintColors?.success)
         case .failure:
             if let failureImage = options.failureImage {
-                display(failureImage, options.failureImageTransition, options.alwaysTransition, fromMemCache, options.contentModes?.failure)
+                display(failureImage, options.failureImageTransition, options.alwaysTransition, fromMemCache, options.contentModes?.failure, options.tintColors?.failure)
             }
         }
         self.task = nil
     }
 
     private func handle(partialImage response: ImageResponse, options: ImageLoadingOptions) {
-        display(response.image, options.transition, options.alwaysTransition, false, options.contentModes?.success)
+        display(response.image, options.transition, options.alwaysTransition, false, options.contentModes?.success, options.tintColors?.success)
     }
 
-    private func display(_ image: UIImage, _ transition: ImageLoadingOptions.Transition?, _ alwaysTransition: Bool, _ fromMemCache: Bool, _ newContentMode: UIView.ContentMode?) {
+    // swiftlint:disable:next function_parameter_count
+    private func display(_ image: UIImage, _ transition: ImageLoadingOptions.Transition?, _ alwaysTransition: Bool, _ fromMemCache: Bool, _ newContentMode: UIView.ContentMode?, _ newTintColor: UIColor?) {
         guard let imageView = imageView else {
             return
+        }
+
+        var image = image
+
+        if let newTintColor = newTintColor {
+            image = image.withRenderingMode(.alwaysTemplate)
+            imageView.tintColor = newTintColor
         }
 
         if !fromMemCache || alwaysTransition, let transition = transition {

@@ -1,5 +1,5 @@
 PODS:
-  - Nuke (8.4.1)
+  - Nuke (9.5.0)
   - RxCocoa (5.0.1):
     - RxRelay (~> 5)
     - RxSwift (~> 5)
@@ -9,7 +9,7 @@ PODS:
   - SwiftLint (0.40.3)
 
 DEPENDENCIES:
-  - Nuke (~> 8.4.1)
+  - Nuke (~> 9.5.0)
   - RxCocoa (~> 5.0.0)
   - RxSwift (~> 5.0.0)
   - SwiftLint (~> 0.40.0)
@@ -23,12 +23,12 @@ SPEC REPOS:
     - SwiftLint
 
 SPEC CHECKSUMS:
-  Nuke: d780e3507a86b86c589ab3cc5cd302d5456f06fb
+  Nuke: 6f400a4ea957e09149ec335a3c6acdcc814d89e4
   RxCocoa: e741b9749968e8a143e2b787f1dfbff2b63d0a5c
   RxRelay: d77f7d771495f43c556cbc43eebd1bb54d01e8e9
   RxSwift: e2dc62b366a3adf6a0be44ba9f405efd4c94e0c4
   SwiftLint: dfd554ff0dff17288ee574814ccdd5cea85d76f7
 
-PODFILE CHECKSUM: a11c163336855d57d8ecad9cb568b038577b9c48
+PODFILE CHECKSUM: 876a13783b6caa5ce89d0714b0e3b8775549757d
 
 COCOAPODS: 1.9.3
