@@ -8,7 +8,7 @@ target 'ios-renovate-example' do
   # Pods for ios-renovate-example
   pod 'RxSwift', '~> 5.0.0'
   pod 'RxCocoa', '~> 5.0.0'
-  pod 'Nuke', '~> 8.4.1'
+  pod 'Nuke', '~> 10.7.0'
   pod 'SwiftLint', '~> 0.40.0'
 
 end
